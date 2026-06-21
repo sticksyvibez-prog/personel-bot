@@ -793,14 +793,25 @@ async def on_interaction(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     init_db()
-    if GUILD_ID:
-        guild_obj = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
-        await bot.tree.sync(guild=guild_obj)
-    else:
-        await bot.tree.sync()
+
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+
+            print(f"Synced {len(synced)} slash commands to guild {GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} global slash commands")
+
+    except Exception as e:
+        print(f"Slash command sync failed: {e}")
+
     if not flight_scheduler.is_running():
         flight_scheduler.start()
+
     print(f"Logged in as {bot.user} | Air Serbia Personnel Core online")
 
 if not TOKEN:
