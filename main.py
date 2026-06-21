@@ -35,10 +35,6 @@ QUALIFICATION_ROLES = {
     "supervisor": 1466425547390189599,
 }
 
-# Users must have a role ABOVE this role in the Discord role hierarchy
-# to use higher-rank operational commands like /postflight.
-HIGHER_RANK_GATE_ROLE = 1466425545880506421
-
 ROLE_RULES = {
     "supervisor": {
         "label": "Supervisor",
@@ -196,31 +192,6 @@ def clean_url(url: str) -> str:
     if not re.match(r"^https?://", url):
         return ""
     return url
-
-def has_higher_rank_permission(member: discord.Member) -> bool:
-    """Return True if member has a role above HIGHER_RANK_GATE_ROLE.
-
-    Server owner and administrators are also allowed.
-    This is used for senior operational commands such as /postflight.
-    """
-    if member.guild.owner_id == member.id:
-        return True
-    if member.guild_permissions.administrator:
-        return True
-
-    gate_role = member.guild.get_role(HIGHER_RANK_GATE_ROLE)
-    if gate_role is None:
-        return False
-
-    return member.top_role.position > gate_role.position
-
-def permission_denied_embed(command_name: str) -> discord.Embed:
-    return error_embed(
-        "Access Denied",
-        f"{EMOJIS['BULLET']} Your credentials could not be verified for `{command_name}`.\n"
-        f"{EMOJIS['BULLET']} Required clearance: a role **above** <@&{HIGHER_RANK_GATE_ROLE}>.\n"
-        f"{EMOJIS['BULLET']} Commands such as `/profile`, `/loa`, `/resignation`, and `/register` remain available to everyone."
-    )
 
 async def get_channel(guild: discord.Guild, channel_id: int):
     ch = guild.get_channel(channel_id)
@@ -735,11 +706,6 @@ async def resignation(interaction: discord.Interaction):
 
 @bot.tree.command(name="postflight", description="Post a flight sheet and schedule automatic join time.")
 async def postflight(interaction: discord.Interaction):
-    member = interaction.user if isinstance(interaction.user, discord.Member) else await interaction.guild.fetch_member(interaction.user.id)
-    if not has_higher_rank_permission(member):
-        await send_log(interaction.guild, "Permission Denied", f"{EMOJIS['BULLET']} **Command:** `/postflight`\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Reason:** Role not above <@&{HIGHER_RANK_GATE_ROLE}>")
-        return await interaction.response.send_message(embed=permission_denied_embed("/postflight"), ephemeral=True)
-
     embed = interface_embed("Flight Operations", "/postflight", ["Flight sheet will ping @everyone", "A thread will be created automatically", "Join time will post automatically", "Attendance will be requested 1 hour after join time"])
     await interaction.response.send_message(embed=embed, view=OpenFormView("open_postflight_form", "Open Flight Form"), ephemeral=True)
 
@@ -809,10 +775,6 @@ async def on_interaction(interaction: discord.Interaction):
     if custom_id == "open_resignation_form":
         return await interaction.response.send_modal(ResignationModal())
     if custom_id == "open_postflight_form":
-        member = interaction.user if isinstance(interaction.user, discord.Member) else await interaction.guild.fetch_member(interaction.user.id)
-        if not has_higher_rank_permission(member):
-            await send_log(interaction.guild, "Permission Denied", f"{EMOJIS['BULLET']} **Interface:** `/postflight` modal\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Reason:** Role not above <@&{HIGHER_RANK_GATE_ROLE}>")
-            return await interaction.response.send_message(embed=permission_denied_embed("/postflight"), ephemeral=True)
         return await interaction.response.send_modal(PostFlightModal())
 
     if custom_id.startswith("allocate_role:"):
