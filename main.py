@@ -164,6 +164,7 @@ def init_db():
             );
             """
         )
+        # Database safety: this never drops or clears tables, so existing registrations stay saved.
         # Add columns safely if the DB was created by an older version.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(employees)").fetchall()}
         needed = {
@@ -258,6 +259,48 @@ async def send_log(guild: discord.Guild, title: str, description: str):
         await channel.send(embeds=[embed], allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         print(f"Failed to send log: {exc}")
+
+
+def personnel_paragraph(action: str, target_name: str, reason: str | None = None, actor_name: str | None = None, extra: str | None = None) -> str:
+    reason_text = reason.strip() if reason and str(reason).strip() else "No specific reason was provided."
+    actor_text = f" by {actor_name}" if actor_name else ""
+    extra_text = f" {extra.strip()}" if extra and str(extra).strip() else ""
+    return (
+        f"This is an official Air Serbia Personnel Core notification regarding **{action}** for **{target_name}**{actor_text}. "
+        f"The recorded reason is: **{reason_text}**.{extra_text} "
+        f"This update has been added to the personnel record and may be reviewed by authorized management staff."
+    )
+
+
+async def send_personnel_dm(user: discord.abc.User, title: str, paragraph: str):
+    embed = discord.Embed(
+        title=f"{EMOJIS['PERSONNEL']} {title}",
+        description=paragraph,
+        color=EMBED_COLOR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="Air Serbia Personnel Core")
+    try:
+        await user.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except Exception as exc:
+        print(f"Failed to DM user {getattr(user, 'id', 'unknown')}: {exc}")
+        return False
+
+
+def extract_reason_from_embed(embed: discord.Embed | None) -> str:
+    if not embed or not embed.description:
+        return "No reason was listed in the original request."
+    desc = embed.description
+    for marker in ["**Reason**", "**Reason:**"]:
+        if marker in desc:
+            tail = desc.split(marker, 1)[1].strip()
+            # Stop before the next double-newline section if one exists.
+            return tail.split("\n\n", 1)[0].strip() or "No reason was listed in the original request."
+    # Fallback for slash-command logs where the reason is on the same line.
+    if "Reason:" in desc:
+        return desc.split("Reason:", 1)[1].split("\n", 1)[0].strip() or "No reason was listed in the original request."
+    return "No reason was listed in the original request."
 
 
 async def is_higher_rank(member: discord.Member) -> bool:
@@ -358,15 +401,30 @@ class RegisterModal(discord.ui.Modal, title="Air Serbia Personnel Registration")
             return await interaction.response.send_message(embed=error_embed("Invalid Roblox ID", f"{EMOJIS['BULLET']} Roblox ID must contain numbers only."), ephemeral=True)
 
         with db() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO employees
-                (discord_id, roblox_username, roblox_id, rank, employee_id, status, created_at)
-                VALUES (?, ?, ?, ?, COALESCE((SELECT employee_id FROM employees WHERE discord_id = ?), ?), 'Pending Review', COALESCE((SELECT created_at FROM employees WHERE discord_id = ?), ?))
-                """,
-                (str(interaction.user.id), self.roblox_username.value, self.roblox_id.value, self.rank.value,
-                 str(interaction.user.id), make_employee_id(interaction.user.id), str(interaction.user.id), now_ts()),
-            )
+            # Safe registration update: do not use INSERT OR REPLACE, because that can reset old points/counters.
+            existing = conn.execute(
+                "SELECT discord_id FROM employees WHERE discord_id = ?",
+                (str(interaction.user.id),),
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE employees
+                    SET roblox_username = ?, roblox_id = ?, rank = ?, status = 'Pending Review'
+                    WHERE discord_id = ?
+                    """,
+                    (self.roblox_username.value, self.roblox_id.value, self.rank.value, str(interaction.user.id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO employees
+                    (discord_id, roblox_username, roblox_id, rank, employee_id, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'Pending Review', ?)
+                    """,
+                    (str(interaction.user.id), self.roblox_username.value, self.roblox_id.value, self.rank.value, make_employee_id(interaction.user.id), now_ts()),
+                )
         add_record(interaction.user.id, "Registration Submitted", f"Roblox: {self.roblox_username.value} ({self.roblox_id.value}) | Rank: {self.rank.value}", interaction.user.id)
 
         embed = discord.Embed(
@@ -392,8 +450,9 @@ class RegisterModal(discord.ui.Modal, title="Air Serbia Personnel Registration")
         approval_channel = await get_channel(interaction.guild, CHANNELS["APPROVALS"])
         await approval_channel.send(embeds=[embed], view=approval_view("register", interaction.user.id), allowed_mentions=discord.AllowedMentions.none())
 
+
         await interaction.response.send_message(
-            embed=success_embed("Registration Submitted", f"{EMOJIS['BULLET']} Your personnel registration has been submitted for review."),
+            embed=success_embed("Registration Submitted", f"{EMOJIS['BULLET']} Your personnel registration has been submitted for review. You will be DM'd after Personnel approves or rejects it."),
             ephemeral=True,
         )
         await send_log(interaction.guild, "Command Log", f"{EMOJIS['BULLET']} **Command:** `/register`\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Status:** Submitted")
@@ -428,7 +487,7 @@ class LOAModal(discord.ui.Modal, title="Leave of Absence Request"):
         embed.set_footer(text="Air Serbia Personnel Core")
         ch = await get_channel(interaction.guild, CHANNELS["APPROVALS"])
         await ch.send(embeds=[embed], view=approval_view("loa", interaction.user.id), allowed_mentions=discord.AllowedMentions.none())
-        await interaction.response.send_message(embed=success_embed("LOA Submitted", f"{EMOJIS['BULLET']} Your LOA request has been sent to Personnel for review."), ephemeral=True)
+        await interaction.response.send_message(embed=success_embed("LOA Submitted", f"{EMOJIS['BULLET']} Your LOA request has been sent to Personnel for review. You will be DM'd after Personnel approves or rejects it."), ephemeral=True)
         await send_log(interaction.guild, "Command Log", f"{EMOJIS['BULLET']} **Command:** `/loa`\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Status:** Submitted")
 
 
@@ -461,7 +520,7 @@ class ResignationModal(discord.ui.Modal, title="Personnel Resignation Request"):
         embed.set_footer(text="Air Serbia Personnel Core")
         ch = await get_channel(interaction.guild, CHANNELS["APPROVALS"])
         await ch.send(embeds=[embed], view=approval_view("resignation", interaction.user.id), allowed_mentions=discord.AllowedMentions.none())
-        await interaction.response.send_message(embed=success_embed("Resignation Submitted", f"{EMOJIS['BULLET']} Your resignation request has been sent to Personnel for review."), ephemeral=True)
+        await interaction.response.send_message(embed=success_embed("Resignation Submitted", f"{EMOJIS['BULLET']} Your resignation request has been sent to Personnel for review. You will be DM'd after Personnel approves or rejects it."), ephemeral=True)
         await send_log(interaction.guild, "Command Log", f"{EMOJIS['BULLET']} **Command:** `/resignation`\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Status:** Submitted")
 
 
@@ -501,6 +560,7 @@ class PostFlightModal(discord.ui.Modal, title="Air Serbia Flight Posting"):
             )
 
         await thread.send(content="@everyone", embeds=[flight_embed], view=flight_allocation_view(flight_id), allowed_mentions=discord.AllowedMentions(everyone=True))
+
 
         await interaction.response.send_message(embed=success_embed("Flight Posted", f"{EMOJIS['BULLET']} Flight `{self.flight_number.value.upper()}` has been posted and the allocation thread has been created."), ephemeral=True)
         await send_log(interaction.guild, "Command Log", f"{EMOJIS['BULLET']} **Command:** `/postflight`\n{EMOJIS['BULLET']} **User:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Flight:** `{self.flight_number.value.upper()}`\n{EMOJIS['BULLET']} **Thread:** <#{thread.id}>\n{EMOJIS['BULLET']} **Status:** Flight posted")
@@ -697,6 +757,38 @@ async def handle_attendance(interaction: discord.Interaction, flight_id: str, se
         conn.execute("INSERT INTO records (discord_id, action, details, actor_id, created_at) VALUES (?, ?, ?, ?, ?)", (str(flight["host_id"]), "Flight Hosted", f"{flight['flight_number']} | {flight['route']} | +2 points", str(interaction.user.id), now_ts()))
         conn.execute("UPDATE flights SET attendance_submitted = 1 WHERE flight_id = ?", (flight_id,))
 
+    for uid in selected_ids:
+        try:
+            crew_user = await bot.fetch_user(int(uid))
+            await send_personnel_dm(
+                crew_user,
+                "Flight Attendance Recorded",
+                personnel_paragraph(
+                    "flight attendance",
+                    crew_user.name,
+                    f"Marked as attended for flight {flight['flight_number']} on route {flight['route']}",
+                    interaction.user.name,
+                    "You have received **+1 flight point** for this flight."
+                ),
+            )
+        except Exception as exc:
+            print(f"Failed to DM attended crew {uid}: {exc}")
+    try:
+        host_user = await bot.fetch_user(int(flight["host_id"]))
+        await send_personnel_dm(
+            host_user,
+            "Flight Host Points Added",
+            personnel_paragraph(
+                "flight hosting credit",
+                host_user.name,
+                f"Hosted flight {flight['flight_number']} on route {flight['route']}",
+                "Air Serbia Flight Operations Core",
+                "You have received **+2 flight points** as the flight host."
+            ),
+        )
+    except Exception as exc:
+        print(f"Failed to DM host after attendance: {exc}")
+
     selected_text = "\n".join(f"{EMOJIS['BULLET']} <@{uid}>" for uid in selected_ids) or f"{EMOJIS['BULLET']} No crew selected."
     embed = success_embed(
         "Attendance Submitted",
@@ -746,10 +838,20 @@ async def handle_approval(interaction: discord.Interaction, kind: str, decision:
     embed.add_field(name=f"{EMOJIS['VERIFIED']} Review Decision", value=f"{EMOJIS['BULLET']} **Decision:** `{label}`\n{EMOJIS['BULLET']} **Reviewer:** {interaction.user.mention}\n{EMOJIS['BULLET']} **Time:** <t:{now_ts()}:F>", inline=False)
     try:
         user = await bot.fetch_user(int(requester_id))
-        dm_embed = success_embed(f"Request {label}", f"{EMOJIS['BULLET']} Your **{kind}** request has been **{label.lower()}**.\n{EMOJIS['BULLET']} **Reviewer:** {interaction.user.mention}")
-        await user.send(embed=dm_embed)
-    except Exception:
-        pass
+        original_reason = extract_reason_from_embed(embed)
+        await send_personnel_dm(
+            user,
+            f"{kind.title()} Request {label}",
+            personnel_paragraph(
+                f"{kind} review decision",
+                user.name,
+                original_reason,
+                interaction.user.name,
+                f"The final review decision is **{label}**."
+            ),
+        )
+    except Exception as exc:
+        print(f"Failed to DM requester after approval review: {exc}")
     await interaction.response.edit_message(embeds=[embed], view=None, allowed_mentions=discord.AllowedMentions.none())
     await send_log(interaction.guild, "Approval Review", f"{EMOJIS['BULLET']} **Type:** `{kind}`\n{EMOJIS['BULLET']} **Decision:** `{label}`\n{EMOJIS['BULLET']} **Requester:** <@{requester_id}>\n{EMOJIS['BULLET']} **Reviewer:** {interaction.user.mention}")
 
@@ -770,7 +872,7 @@ async def handle_recruit_apply(interaction: discord.Interaction, position: str):
     )
     embed.set_footer(text="Air Serbia Recruitment Core")
     await ch.send(content=f"<@&{RECRUITMENT_PING_ROLE_ID}>", embeds=[embed], allowed_mentions=discord.AllowedMentions(roles=True))
-    await interaction.response.send_message(embed=success_embed("Application Sent", f"{EMOJIS['BULLET']} Your application for **{position}** has been submitted."), ephemeral=True)
+    await interaction.response.send_message(embed=success_embed("Application Sent", f"{EMOJIS['BULLET']} Your application for **{position}** has been submitted. The department may DM you for an interview."), ephemeral=True)
     await send_log(interaction.guild, "Recruitment Application", f"{EMOJIS['BULLET']} **Applicant:** {interaction.user.mention} `{interaction.user.id}`\n{EMOJIS['BULLET']} **Position:** `{position}`")
 
 # =========================
@@ -882,7 +984,18 @@ async def promote(interaction: discord.Interaction, user: discord.Member, new_ra
         old = conn.execute("SELECT rank FROM employees WHERE discord_id = ?", (str(user.id),)).fetchone()["rank"]
         conn.execute("UPDATE employees SET rank = ?, promotions = promotions + 1, status = 'Active' WHERE discord_id = ?", (new_rank, str(user.id)))
     add_record(user.id, "Rank Updated / Promotion", f"Old rank: {old or 'Not Set'} | New rank: {new_rank}", interaction.user.id)
-    await interaction.response.send_message(embed=success_embed("Rank Updated", f"{EMOJIS['BULLET']} {user.mention}'s rank has been changed to `{new_rank}`."), allowed_mentions=discord.AllowedMentions.none())
+    await send_personnel_dm(
+        user,
+        "Rank Updated",
+        personnel_paragraph(
+            "rank update / promotion",
+            user.name,
+            f"Rank changed from {old or 'Not Set'} to {new_rank}",
+            interaction.user.name,
+            "Your updated rank will now appear in your `/profile` command."
+        ),
+    )
+    await interaction.response.send_message(embed=success_embed("Rank Updated", f"{EMOJIS['BULLET']} {user.mention}'s rank has been changed to `{new_rank}` and the user has been DM'd."), allowed_mentions=discord.AllowedMentions.none())
     await send_log(interaction.guild, "Promotion / Rank Change", f"{EMOJIS['BULLET']} **Employee:** {user.mention}\n{EMOJIS['BULLET']} **New Rank:** `{new_rank}`\n{EMOJIS['BULLET']} **By:** {interaction.user.mention}")
 
 
@@ -896,7 +1009,18 @@ async def demote(interaction: discord.Interaction, user: discord.Member, new_ran
         old = conn.execute("SELECT rank FROM employees WHERE discord_id = ?", (str(user.id),)).fetchone()["rank"]
         conn.execute("UPDATE employees SET rank = ?, demotions = demotions + 1 WHERE discord_id = ?", (new_rank, str(user.id)))
     add_record(user.id, "Demotion", f"Old rank: {old or 'Not Set'} | New rank: {new_rank} | Reason: {reason}", interaction.user.id)
-    await interaction.response.send_message(embed=success_embed("Demotion Recorded", f"{EMOJIS['BULLET']} {user.mention}'s rank has been changed to `{new_rank}`.\n{EMOJIS['BULLET']} **Reason:** {reason}"), allowed_mentions=discord.AllowedMentions.none())
+    await send_personnel_dm(
+        user,
+        "Demotion Recorded",
+        personnel_paragraph(
+            "demotion",
+            user.name,
+            reason,
+            interaction.user.name,
+            f"Your rank has been changed from **{old or 'Not Set'}** to **{new_rank}**."
+        ),
+    )
+    await interaction.response.send_message(embed=success_embed("Demotion Recorded", f"{EMOJIS['BULLET']} {user.mention}'s rank has been changed to `{new_rank}` and the user has been DM'd.\n{EMOJIS['BULLET']} **Reason:** {reason}"), allowed_mentions=discord.AllowedMentions.none())
     await send_log(interaction.guild, "Demotion", f"{EMOJIS['BULLET']} **Employee:** {user.mention}\n{EMOJIS['BULLET']} **New Rank:** `{new_rank}`\n{EMOJIS['BULLET']} **By:** {interaction.user.mention}")
 
 
@@ -909,7 +1033,18 @@ async def terminate(interaction: discord.Interaction, user: discord.Member, reas
     with db() as conn:
         conn.execute("UPDATE employees SET status = 'Terminated', terminations = terminations + 1 WHERE discord_id = ?", (str(user.id),))
     add_record(user.id, "Termination", reason, interaction.user.id)
-    await interaction.response.send_message(embed=success_embed("Termination Recorded", f"{EMOJIS['BULLET']} {user.mention} has been marked as **Terminated**.\n{EMOJIS['BULLET']} **Reason:** {reason}"), allowed_mentions=discord.AllowedMentions.none())
+    await send_personnel_dm(
+        user,
+        "Termination Recorded",
+        personnel_paragraph(
+            "termination",
+            user.name,
+            reason,
+            interaction.user.name,
+            "Your personnel profile status has been updated to **Terminated**."
+        ),
+    )
+    await interaction.response.send_message(embed=success_embed("Termination Recorded", f"{EMOJIS['BULLET']} {user.mention} has been marked as **Terminated** and the user has been DM'd.\n{EMOJIS['BULLET']} **Reason:** {reason}"), allowed_mentions=discord.AllowedMentions.none())
     await send_log(interaction.guild, "Termination", f"{EMOJIS['BULLET']} **Employee:** {user.mention}\n{EMOJIS['BULLET']} **Reason:** `{reason}`\n{EMOJIS['BULLET']} **By:** {interaction.user.mention}")
 
 
@@ -927,7 +1062,18 @@ async def warning(interaction: discord.Interaction, user: discord.Member, catego
     desc = f"{EMOJIS['BULLET']} **Employee:** {user.mention}\n{EMOJIS['BULLET']} **Category:** `{category}`\n{EMOJIS['BULLET']} **Reason:** {reason}"
     if link:
         desc += f"\n{EMOJIS['BULLET']} **Evidence:** [View Evidence]({link})"
-    await interaction.response.send_message(embed=success_embed("Warning Issued", desc), allowed_mentions=discord.AllowedMentions.none())
+    await send_personnel_dm(
+        user,
+        "Warning Issued",
+        personnel_paragraph(
+            "warning",
+            user.name,
+            reason,
+            interaction.user.name,
+            f"Warning category: **{category}**." + (f" Evidence: [View Evidence]({link})." if link else "")
+        ),
+    )
+    await interaction.response.send_message(embed=success_embed("Warning Issued", desc + f""), allowed_mentions=discord.AllowedMentions.none())
     await send_log(interaction.guild, "Warning", f"{EMOJIS['BULLET']} **Employee:** {user.mention}\n{EMOJIS['BULLET']} **Category:** `{category}`\n{EMOJIS['BULLET']} **By:** {interaction.user.mention}")
 
 
